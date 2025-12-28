@@ -1,0 +1,61 @@
+telegram_exp/
+├── 📁 agents/                          ← NEW: All specialized agents
+│   ├── __init__.py
+│   ├── base_agent.py                  ← Base class with common functionality
+│   ├── journal_agent.py               ← Compassionate listener (refactored)
+│   ├── health_agent.py                ← Wellness companion
+│   ├── wealth_agent.py                ← Financial assistant
+│   ├── rants_agent.py                 ← Venting space
+│   ├── ideas_agent.py                 ← Creative thinking partner
+│   ├── ai_engineering_agent.py        ← Technical AI/ML assistant
+│   ├── career_agent.py                ← Career advisor
+│   └── general_agent.py               ← Versatile fallback agent
+│
+├── 📁 tools/                           ← NEW: Common agent tools
+│   ├── __init__.py
+│   └── common_tools.py                ← Web search & scraping
+│
+├── 📄 agent_router.py                 ← NEW: Central routing logic
+├── 📄 test_agents.py                  ← NEW: Test all agents
+│
+├── 📄 telegram_bot.py                 ← MODIFIED: Now uses router
+├── 📄 bot.db                          ← Database (unchanged schema)
+├── 📄 .env                            ← Config (unchanged)
+│
+├── 📄 ARCHITECTURE.md                 ← NEW: Architecture documentation
+├── 📄 MIGRATION_GUIDE.md              ← NEW: Migration instructions
+├── 📄 AGENTS_REFERENCE.md             ← NEW: Agent behaviors reference
+├── 📄 PROJECT_STRUCTURE.txt           ← NEW: This file
+│
+├── 📄 journal_agent.py                ← OLD: No longer used
+├── 📄 agent_utils.py                  ← OLD: No longer used
+│
+└── 📄 [other existing files]          ← Unchanged
+    ├── pyproject.toml
+    ├── README.md
+    ├── IMPLEMENTATION_SUMMARY.md
+    ├── notes.txt
+    ├── verify_jina.py
+    └── verify_linkedin.py
+
+SUMMARY:
+========
+✅ Created:  11 new files (8 agents + router + tools + docs)
+✅ Modified: 1 file (telegram_bot.py)
+✅ Obsolete: 2 files (old journal_agent.py, agent_utils.py)
+
+TOTAL AGENTS: 8
+- Journal
+- Health
+- Wealth
+- Rants
+- Ideas
+- AI Engineering
+- Career
+- General
+
+ARCHITECTURE: Router-Worker Pattern
+FRAMEWORK: Agno v0.9.0+
+MODEL: Gemini 3.0 Flash Preview (OpenRouter)
+TOOLS: Web Search, Web Scraping (all agents)
+MEMORY: Last 10 messages per topic per user

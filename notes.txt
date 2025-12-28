@@ -1,0 +1,8 @@
+Now we need to add an auto categorization and summarization feature. 
+
+1. Auto categorization feature: 
+- Whenever a message is recieved you need to categorize them based on the primary and secondary tags. Secondary tags are granular categories of the primary category. The primary categories are : "AI Engineering", "General", "Rants", "Ideas", "Health", "Wealth", "Journal". 
+- You should openrouter via the openai library. I will provide the openrouter api key and the model to be used later. 
+- These categories then needs to be added as metadata and then saved to the database. 
+
+2. Auto summarization feature: 

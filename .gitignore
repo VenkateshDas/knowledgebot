@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+.python-version
+
+# Env
+.env
+.env.local
+
+# UV
+uv.lock
+
+# Database and logs
+*.db
+*.log
+debug_log.txt
