@@ -30,7 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = "8497263383:AAEWuUq_F7fYPtev5ymbsIN9cnWlF0vgG3Q"
-DB_PATH = "bot.db"
+DB_PATH = os.getenv("DB_PATH", "bot.db")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "").strip()
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m2.1")

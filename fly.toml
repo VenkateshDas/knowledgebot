@@ -1,0 +1,24 @@
+# fly.toml app configuration file generated for telegram-exp on 2025-12-28T21:20:02+01:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'telegram-exp'
+primary_region = 'fra'
+
+[build]
+
+# Remove http_service - Telegram bots use polling, not HTTP
+# This prevents the "not listening on port" warning
+
+[env]
+  # Non-sensitive environment variables
+
+[[vm]]
+  cpus = 1
+  memory_mb = 256
+
+# Persistent volume for SQLite database
+[[mounts]]
+  source = "bot_data"
+  destination = "/data"

@@ -21,7 +21,7 @@ from tools.common_tools import web_search, web_scrape
 logger = logging.getLogger(__name__)
 
 # Configuration
-DB_PATH = "bot.db"
+DB_PATH = os.getenv("DB_PATH", "bot.db")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m2.1")
 
 

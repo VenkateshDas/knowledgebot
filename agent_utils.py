@@ -9,12 +9,13 @@ import sqlite3
 import logging
 import json
 import asyncio
+import os
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = "bot.db"
+DB_PATH = os.getenv("DB_PATH", "bot.db")
 
 
 def get_journal_context(chat_id: int, thread_id: int, limit: int = 10) -> List[Dict]:

@@ -10,10 +10,10 @@ __pycache__/
 .env
 .env.local
 
-# UV
-uv.lock
-
 # Database and logs
 *.db
 *.log
 debug_log.txt
+
+# Claude
+.claude/
