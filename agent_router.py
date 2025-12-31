@@ -84,7 +84,6 @@ class AgentRouter:
         thread_id: Optional[int],
         text: str,
         message_id: int,
-        categorize_func=None,
         update_categories_func=None
     ) -> Tuple[str, Optional[str], Optional[str]]:
         """
@@ -97,7 +96,6 @@ class AgentRouter:
             thread_id: Telegram thread ID
             text: Message text
             message_id: Database message ID
-            categorize_func: Optional async categorization function (DEPRECATED - agent handles tagging)
             update_categories_func: Optional function to update categories in DB
 
         Returns:
@@ -111,11 +109,13 @@ class AgentRouter:
 
             # Get agent response (runs in executor to avoid blocking)
             # Agent handles categorization inline now - single call
+            # Pass message_id for RAG context
             response_text = await asyncio.get_event_loop().run_in_executor(
                 None,
                 agent.run,
                 text,
-                thread_id
+                thread_id,
+                message_id
             )
 
             # Parse tags from agent response
@@ -149,6 +149,8 @@ class AgentRouter:
 
         Tags: tag1, tag2, tag3
 
+        Falls back to keyword extraction if no Tags: line found.
+
         Args:
             response_text: Agent's full response
 
@@ -175,29 +177,58 @@ class AgentRouter:
             logger.info(f"Parsed tags: {tags}")
             return formatted_response, tags
         else:
-            logger.warning("No tags found in agent response")
+            # Fallback: Extract simple keywords from response
+            logger.warning("No tags found in agent response, using fallback extraction")
+            fallback_tags = self._extract_fallback_tags(response_text)
+
+            if fallback_tags:
+                formatted_response = f"{response_text}\n\n📁 Tags: {', '.join(fallback_tags)}"
+                return formatted_response, fallback_tags
+
             return response_text, []
 
-    def _format_response(
-        self,
-        response_text: str,
-        primary_category: Optional[str],
-        secondary_tags_json: Optional[str]
-    ) -> str:
+    def _extract_fallback_tags(self, text: str, max_tags: int = 3) -> list:
         """
-        Format the final response with agent reply and categories.
+        Extract fallback tags from text using simple keyword detection.
 
-        DEPRECATED: Agent now handles tags inline.
+        Looks for capitalized words and common topic indicators.
 
         Args:
-            response_text: Agent's response
-            primary_category: Primary category
-            secondary_tags_json: Secondary tags as JSON string
+            text: Response text to extract tags from
+            max_tags: Maximum number of tags to return
 
         Returns:
-            Formatted response string
+            List of extracted tags
         """
-        return response_text
+        import re
+
+        # Common stop words to ignore
+        stop_words = {
+            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+            'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been',
+            'be', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+            'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'this',
+            'that', 'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they',
+            'what', 'which', 'who', 'when', 'where', 'why', 'how', 'all', 'each',
+            'every', 'both', 'few', 'more', 'most', 'other', 'some', 'such', 'no',
+            'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 'just',
+            'your', 'my', 'our', 'their', 'its', 'his', 'her', 'here', 'there'
+        }
+
+        # Extract words (focus on nouns and key terms)
+        words = re.findall(r'\b[a-zA-Z]{4,15}\b', text.lower())
+
+        # Count frequency
+        word_counts = {}
+        for word in words:
+            if word not in stop_words:
+                word_counts[word] = word_counts.get(word, 0) + 1
+
+        # Sort by frequency and take top N
+        sorted_words = sorted(word_counts.items(), key=lambda x: x[1], reverse=True)
+        tags = [word for word, count in sorted_words[:max_tags] if count >= 1]
+
+        return tags
 
     def list_available_agents(self) -> dict:
         """

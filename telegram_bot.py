@@ -1,26 +1,30 @@
 # telegram_bot.py
+"""
+Main Telegram bot application.
 
-import sqlite3
+Handles message routing to specialized agents and topic management.
+"""
+
 import logging
+import re
+import asyncio
 from datetime import datetime, UTC
+
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
-import os
-import requests
-from openai import OpenAI
-import re
-import json
-from contextlib import contextmanager
-from dotenv import load_dotenv
-import asyncio
+
+# Core modules (centralized config, database, LLM client)
+from core.config import config
+from core.database import db_session, init_db
 
 # Import agent router
 from agent_router import get_router
 
-load_dotenv()
+# Import indexing worker
+from indexing_worker import get_indexing_worker
 
 # ==========================================================
-# CONFIG
+# LOGGING SETUP
 # ==========================================================
 
 logging.basicConfig(
@@ -29,91 +33,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = "8497263383:AAEWuUq_F7fYPtev5ymbsIN9cnWlF0vgG3Q"
-DB_PATH = os.getenv("DB_PATH", "bot.db")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "").strip()
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m2.1")
-
-if not OPENROUTER_API_KEY:
-    logger.warning("OPENROUTER_API_KEY is not set. Categorization and summarization will fail.")
-if not FIRECRAWL_API_KEY:
-    logger.warning("FIRECRAWL_API_KEY is not set. Summarization will fail.")
-
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-)
-
-
-
-# ==========================================================
-# DATABASE
-# ==========================================================
-
-def init_db():
-    logger.info("Initializing database...")
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS topics (
-        chat_id INTEGER,
-        thread_id INTEGER,
-        topic_name TEXT,
-        updated_at TEXT,
-        PRIMARY KEY (chat_id, thread_id)
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER,
-        thread_id INTEGER,
-        topic_name TEXT,
-        message_id INTEGER,
-        user_id INTEGER,
-        username TEXT,
-        message_type TEXT,
-        text TEXT,
-        file_id TEXT,
-        file_unique_id TEXT,
-        message_link TEXT,
-        created_at TEXT
-    )
-    """)
-
-    conn.commit()
-
-    # Migration for new columns
-    cur = conn.cursor()
-    new_columns = [
-        ("primary_category", "TEXT"),
-        ("secondary_tags", "TEXT"),
-        ("extracted_link", "TEXT"),
-        ("summary", "TEXT")
-    ]
-    
-    for col_name, col_type in new_columns:
-        try:
-            cur.execute(f"ALTER TABLE messages ADD COLUMN {col_name} {col_type}")
-            logger.info(f"Added column {col_name} to messages table.")
-        except sqlite3.OperationalError:
-            pass # Column likely exists
-
-    conn.commit()
-    conn.close()
-
-@contextmanager
-def db_session():
-    """Context manager for database connections."""
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        yield conn.cursor()
-        conn.commit()
-    finally:
-        conn.close()
 
 # ==========================================================
 # HELPERS
@@ -233,98 +152,6 @@ def parse_message(msg):
 
     return msg_type, text, file_id, file_uid
 
-def categorize_message(text, topic_name=None):
-    if not text or not OPENROUTER_API_KEY:
-        return None, None
-
-    # Check if we should use topic as primary category
-    use_topic_as_category = (
-        topic_name and
-        topic_name != "General" and
-        not topic_name.startswith("Topic_")
-    )
-
-    try:
-        if use_topic_as_category:
-            # Topic name is the primary category, only get secondary tags from LLM
-            completion = client.chat.completions.create(
-                model=OPENROUTER_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a helpful assistant that generates relevant tags for messages.\n"
-                            "Generate 2-5 short, descriptive keywords related to the message content.\n"
-                            "Output ONLY a JSON object in this exact format:\n"
-                            "{\"secondary_tags\": [\"tag1\", \"tag2\", \"tag3\"]}\n"
-                            "Example: {\"secondary_tags\": [\"startup\", \"mobile app\", \"product idea\"]}"
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": text
-                    }
-                ]
-            )
-
-            content = completion.choices[0].message.content.strip()
-            logger.debug(f"Categorization response (tags): {content}")
-
-            # Try to extract JSON if wrapped in code blocks
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-
-            data = json.loads(content)
-            return topic_name, json.dumps(data.get("secondary_tags", []))
-        else:
-            # No topic or generic topic, let LLM choose both category and tags
-            completion = client.chat.completions.create(
-                model=OPENROUTER_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a helpful assistant that categorizes messages.\n"
-                            "The primary categories are: 'AI Engineering', 'General', 'Rants', 'Ideas', 'Health', 'Wealth', 'Journal'.\n"
-                            "Output ONLY a JSON object in this exact format:\n"
-                            "{\"primary_category\": \"category_name\", \"secondary_tags\": [\"tag1\", \"tag2\"]}\n"
-                            "Example: {\"primary_category\": \"Ideas\", \"secondary_tags\": [\"startup\", \"mobile app\"]}"
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": text
-                    }
-                ]
-            )
-
-            content = completion.choices[0].message.content.strip()
-            logger.debug(f"Categorization response (full): {content}")
-
-            # Try to extract JSON if wrapped in code blocks
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-
-            data = json.loads(content)
-            return data.get("primary_category"), json.dumps(data.get("secondary_tags", []))
-
-    except json.JSONDecodeError as e:
-        logger.error(f"Error parsing categorization JSON: {e}. Content: {content[:200]}")
-        return None, None
-    except Exception as e:
-        logger.error(f"Error classifying message: {e}")
-        return None, None
-
-# --- Journal Agent Integration Helpers ---
-
-async def categorize_message_async(text, topic_name=None):
-    """Async wrapper for categorize_message to use in journal handler."""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, categorize_message, text, topic_name)
 
 def update_message_categories(message_id, primary_category, secondary_tags):
     """Update message with categorization results."""
@@ -338,94 +165,15 @@ def update_message_categories(message_id, primary_category, secondary_tags):
     except Exception as e:
         logger.error(f"Failed to update categories: {e}")
 
-# --- End Journal Integration Helpers ---
 
 def extract_first_link(text):
+    """Extract the first URL from text."""
     if not text:
         return None
     url_pattern = r'(https?://[^\s]+)'
     match = re.search(url_pattern, text)
     return match.group(0) if match else None
 
-def scrape_with_jina(url):
-    """Fallback scraping using Jina Reader."""
-    try:
-        logger.info(f"Scraping with Jina Reader: {url}")
-        jina_url = f"https://r.jina.ai/{url}"
-        response = requests.get(jina_url)
-        if response.status_code == 200:
-            return response.text
-        else:
-            logger.error(f"Jina Reader failed: {response.status_code} - {response.text}")
-    except Exception as e:
-        logger.error(f"Error in Jina scraping: {e}")
-    return None
-
-def scrape_and_summarize(url):
-    if not url or not OPENROUTER_API_KEY:
-        return None
-        
-    markdown_content = None
-
-    # 1. Determine scraping method
-    # Prefer Firecrawl generally, but use Jina for LinkedIn or fallback
-    use_jina = "linkedin.com" in url
-    
-    if not use_jina and FIRECRAWL_API_KEY:
-        try:
-            scrape_url = "https://api.firecrawl.dev/v1/scrape"
-            headers = {
-                "Authorization": f"Bearer {FIRECRAWL_API_KEY}",
-                "Content-Type": "application/json"
-            }
-            payload = {"url": url}
-            
-            response = requests.post(scrape_url, json=payload, headers=headers)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("success"):
-                    markdown_content = data.get("data", {}).get("markdown", "")
-            
-            if not markdown_content:
-                logger.warning(f"Firecrawl failed or empty for {url}. Attempting fallback.")
-        except Exception as e:
-            logger.error(f"Firecrawl error: {e}")
-    
-    # 2. Fallback / Direct Jina
-    if not markdown_content:
-        markdown_content = scrape_with_jina(url)
-
-    if not markdown_content:
-        logger.error("All scraping methods failed.")
-        return None
-
-    # 3. Summarize with OpenRouter
-    try:
-        completion = client.chat.completions.create(
-            model=OPENROUTER_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are an expert summarizer. Create a concise, information-dense summary of the content.\n"
-                        "Format your response as 5-10 bullet points maximum.\n"
-                        "Use PLAIN TEXT only - no Markdown formatting, no asterisks, no underscores, no hashtags.\n"
-                        "Start each bullet point with a dash (-) or bullet (•).\n"
-                        "Focus on the most important insights, key takeaways, and actionable information.\n"
-                        "Be direct and clear. Each bullet should be one concise sentence or phrase."
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": markdown_content[:50000] 
-                }
-            ]
-        )
-        return completion.choices[0].message.content
-        
-    except Exception as e:
-        logger.error(f"Error in summary generation: {e}")
-        return None
 
 # ==========================================================
 # COMMAND HANDLERS
@@ -615,22 +363,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 thread_id=thread_id,
                 text=text,
                 message_id=db_message_id,
-                categorize_func=categorize_message_async,
                 update_categories_func=update_message_categories
             )
 
-            # Update database with extracted link (for record-keeping)
+            # Update database with extracted link and summary (for indexing worker)
             extracted_url = extract_first_link(text)
             if extracted_url:
+                # Get scraped content from cache (populated by web_scrape tool)
+                scraped_summary = None
+                try:
+                    # Check url_scrape_cache table for the summary
+                    with db_session() as cur:
+                        cur.execute(
+                            "SELECT summary FROM url_scrape_cache WHERE url = ?",
+                            (extracted_url,)
+                        )
+                        row = cur.fetchone()
+                        if row:
+                            scraped_summary = row[0]
+                            logger.debug(f"Found cached summary for {extracted_url}")
+                except Exception as e:
+                    logger.error(f"Error fetching summary from cache: {e}")
+
+                # Update messages table with link and summary
                 with db_session() as cur:
-                    cur.execute(
-                        "UPDATE messages SET extracted_link = ? WHERE id = ?",
-                        (extracted_url, db_message_id)
-                    )
+                    if scraped_summary:
+                        cur.execute(
+                            "UPDATE messages SET extracted_link = ?, summary = ? WHERE id = ?",
+                            (extracted_url, scraped_summary, db_message_id)
+                        )
+                        logger.info(f"Updated message {db_message_id} with URL and summary")
+                    else:
+                        cur.execute(
+                            "UPDATE messages SET extracted_link = ? WHERE id = ?",
+                            (extracted_url, db_message_id)
+                        )
+                        logger.info(f"Updated message {db_message_id} with URL (summary not yet available)")
 
             # Send agent response directly (agent handles link summarization via web_scrape tool)
             logger.info(f"Successfully processed message {msg.message_id}")
-            await msg.reply_text(response_text)
+
+            # Safety check: Ensure response is not empty
+            if response_text and response_text.strip():
+                await msg.reply_text(response_text)
+            else:
+                logger.warning(f"Agent returned empty response for message {msg.message_id}")
+                await msg.reply_text("✅ Got it! I'm processing this information.")
 
         else:
             # Non-text message (photos, videos, etc.) - simple acknowledgment
@@ -646,7 +424,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    async def post_init(application):
+        """Post-initialization hook to start background tasks."""
+        # Set main event loop reference for RAG tools
+        # This is required for asyncpg connection pools in production mode
+        from tools.rag_tools import set_main_loop
+        loop = asyncio.get_running_loop()
+        set_main_loop(loop)
+
+        # Pre-initialize LightRAG instances for faster first queries
+        # This avoids 7+ second initialization delay on first message
+        from lightrag_manager import warm_up_lightrag
+        logger.info("Warming up LightRAG instances...")
+        await warm_up_lightrag()
+
+        # Start URL indexing worker in background
+        indexing_worker = get_indexing_worker()
+        asyncio.create_task(indexing_worker.start())
+        logger.info("Bot is running with RAG indexing worker")
+
+    app = ApplicationBuilder().token(config.telegram_bot_token).post_init(post_init).build()
 
     # Command handlers
     app.add_handler(CommandHandler("name_topic", name_topic_command))
@@ -660,7 +457,6 @@ def main():
         )
     )
 
-    logger.info("Bot is running")
     app.run_polling()
 
 if __name__ == "__main__":

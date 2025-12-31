@@ -13,6 +13,13 @@ primary_region = 'fra'
 
 [env]
   # Non-sensitive environment variables
+  DB_PATH = "/data/bot.db"
+  LIGHTRAG_WORKING_DIR = "/data/lightrag_data"
+  LIGHTRAG_PRODUCTION = "true"
+  LIGHTRAG_DEFAULT_MODE = "hybrid"
+  LIGHTRAG_TOP_K = "5"
+  INDEXING_POLL_INTERVAL = "10"
+  INDEXING_BATCH_SIZE = "10"
 
 [[vm]]
   cpus = 1

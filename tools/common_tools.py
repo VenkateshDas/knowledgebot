@@ -5,30 +5,56 @@ Provides web search and web scraping capabilities using OpenRouter API,
 Firecrawl, and Jina Reader as fallback.
 """
 
-import os
 import re
 import logging
 import requests
 from typing import Optional
-from openai import OpenAI
-from dotenv import load_dotenv
+from collections import OrderedDict
+from threading import Lock
 
-# Load environment variables
-load_dotenv()
+from core.config import config
+from core.database import save_to_scrape_cache, get_from_scrape_cache
+from core.llm_client import get_openai_client
 
 logger = logging.getLogger(__name__)
 
-# Get configuration from environment
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY", "").strip()
-PARALLEL_API_KEY = os.getenv("PARALLEL_API_KEY", "").strip()
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "minimax/minimax-m2.1")
 
-# Initialize OpenRouter client
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-)
+class LRUCache:
+    """Thread-safe LRU cache with configurable max size."""
+
+    def __init__(self, max_size: int = 100):
+        self.cache = OrderedDict()
+        self.max_size = max_size
+        self.lock = Lock()
+
+    def get(self, key: str) -> Optional[dict]:
+        """Get item from cache, moving it to end (most recent)."""
+        with self.lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+                return self.cache[key]
+            return None
+
+    def set(self, key: str, value: dict) -> None:
+        """Set item in cache, evicting oldest if at capacity."""
+        with self.lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+            else:
+                if len(self.cache) >= self.max_size:
+                    # Remove oldest (first) item
+                    oldest_key = next(iter(self.cache))
+                    del self.cache[oldest_key]
+                    logger.debug(f"Evicted oldest cache entry: {oldest_key}")
+            self.cache[key] = value
+
+    def __contains__(self, key: str) -> bool:
+        with self.lock:
+            return key in self.cache
+
+
+# LRU cache for scraped content (replaces unbounded dict)
+_scraped_content_cache = LRUCache(max_size=config.scrape_cache_max_size)
 
 
 def web_search(query: str, max_results: int = 6) -> str:
@@ -47,7 +73,7 @@ def web_search(query: str, max_results: int = 6) -> str:
     Returns:
         Formatted search results with excerpts and sources
     """
-    if not PARALLEL_API_KEY:
+    if not config.parallel_api_key:
         logger.error("Parallel API key not configured")
         return "Error: PARALLEL_API_KEY not configured in environment variables."
 
@@ -58,7 +84,7 @@ def web_search(query: str, max_results: int = 6) -> str:
         search_url = "https://api.parallel.ai/v1beta/search"
 
         headers = {
-            "x-api-key": PARALLEL_API_KEY,
+            "x-api-key": config.parallel_api_key,
             "Content-Type": "application/json",
             "parallel-beta": "search-extract-2025-10-10"  # Required beta version header
         }
@@ -189,14 +215,14 @@ def scrape_with_firecrawl(url: str) -> Optional[str]:
     Returns:
         Scraped content as markdown, or None if failed
     """
-    if not FIRECRAWL_API_KEY:
+    if not config.firecrawl_api_key:
         return None
 
     try:
         logger.info(f"Scraping with Firecrawl: {url}")
         scrape_url = "https://api.firecrawl.dev/v1/scrape"
         headers = {
-            "Authorization": f"Bearer {FIRECRAWL_API_KEY}",
+            "Authorization": f"Bearer {config.firecrawl_api_key}",
             "Content-Type": "application/json"
         }
         payload = {"url": url}
@@ -216,6 +242,33 @@ def scrape_with_firecrawl(url: str) -> Optional[str]:
         return None
 
 
+def get_scraped_content(url: str) -> Optional[dict]:
+    """
+    Get cached scraped content for a URL.
+
+    Checks in-memory cache first, then database.
+
+    Args:
+        url: URL to lookup
+
+    Returns:
+        Cached content dict or None
+    """
+    # Check in-memory LRU cache first
+    cached = _scraped_content_cache.get(url)
+    if cached:
+        return cached
+
+    # Check database cache
+    db_cache = get_from_scrape_cache(url)
+    if db_cache:
+        # Populate in-memory cache for faster subsequent access
+        _scraped_content_cache.set(url, db_cache)
+        return db_cache
+
+    return None
+
+
 def web_scrape(url: str) -> str:
     """
     Scrape and summarize web content.
@@ -223,16 +276,18 @@ def web_scrape(url: str) -> str:
     Uses Firecrawl as primary method, falls back to Jina Reader.
     Always uses Jina for LinkedIn URLs.
 
+    Caches full content for later indexing by the RAG worker.
+
     Args:
         url: URL to scrape
 
     Returns:
-        Summary of the scraped content
+        Summary text for agent consumption (full content cached internally)
     """
     if not url:
         return "Error: No URL provided."
 
-    if not OPENROUTER_API_KEY:
+    if not config.openrouter_api_key:
         return "Error: OpenRouter API key not configured."
 
     markdown_content = None
@@ -250,8 +305,9 @@ def web_scrape(url: str) -> str:
 
     # Summarize with LLM
     try:
+        client = get_openai_client()
         completion = client.chat.completions.create(
-            model=OPENROUTER_MODEL,
+            model=config.openrouter_model,
             messages=[
                 {
                     "role": "system",
@@ -271,12 +327,38 @@ def web_scrape(url: str) -> str:
         )
 
         summary = completion.choices[0].message.content
+        summary_text = f"Summary of {url}:\n\n{summary}"
+
+        # Cache full content for indexing worker (both in-memory LRU cache and database)
+        cache_data = {
+            "summary": summary_text,
+            "full_content": markdown_content,
+            "url": url
+        }
+        _scraped_content_cache.set(url, cache_data)
+
+        # Persist to database for cross-restart persistence
+        save_to_scrape_cache(url, summary_text, markdown_content)
+
         logger.info(f"Successfully scraped and summarized: {url}")
-        return f"Summary of {url}:\n\n{summary}"
+        return summary_text
 
     except Exception as e:
         logger.error(f"Error in summary generation: {e}")
-        return f"Error summarizing content: {str(e)}"
+
+        # Cache even if summary fails (both in-memory and database)
+        error_summary = f"Error summarizing content: {str(e)}"
+        cache_data = {
+            "summary": error_summary,
+            "full_content": markdown_content,
+            "url": url
+        }
+        _scraped_content_cache.set(url, cache_data)
+
+        # Persist to database
+        save_to_scrape_cache(url, error_summary, markdown_content)
+
+        return error_summary
 
 
 def extract_url_from_text(text: str) -> Optional[str]:
