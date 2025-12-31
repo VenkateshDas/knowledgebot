@@ -15,8 +15,8 @@ ENV PYTHONUNBUFFERED=1 \
 # Copy dependency files
 COPY pyproject.toml uv.lock ./
 
-# Install dependencies using uv
-RUN uv sync --frozen --no-dev
+# Install dependencies using uv (including production extras for database support)
+RUN uv sync --frozen --no-dev --extra production
 
 # Copy application code
 COPY . .
