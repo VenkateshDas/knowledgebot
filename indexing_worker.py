@@ -140,6 +140,14 @@ class URLIndexingWorker:
 
         logger.info(f"Indexing URL for topic '{topic_name}': {url}")
 
+        # Check if URL already indexed in this topic
+        from core.database import check_url_indexed, mark_url_indexed
+
+        if check_url_indexed(url, topic_name):
+            logger.info(f"Skipping duplicate URL: {url} in topic {topic_name}")
+            self._mark_as_indexed(message_id, "duplicate")
+            return
+
         # Try to get cached content first
         scraped_data = get_scraped_content(url)
 
@@ -165,6 +173,8 @@ class URLIndexingWorker:
         if success:
             # Mark as indexed in database
             self._mark_as_indexed(message_id, "auto_url")
+            # Track in indexed_urls table
+            mark_url_indexed(url, topic_name, message_id)
             logger.info(f"Successfully indexed URL: {url}")
         else:
             logger.error(f"Failed to index URL: {url}")

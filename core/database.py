@@ -134,6 +134,21 @@ def init_db() -> None:
     )
     """)
 
+    # Create indexed URLs tracking table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS indexed_urls (
+        url TEXT NOT NULL,
+        original_url TEXT NOT NULL,
+        topic_name TEXT NOT NULL,
+        first_indexed_at TEXT NOT NULL,
+        first_message_id INTEGER NOT NULL,
+        last_seen_at TEXT,
+        times_shared INTEGER DEFAULT 1,
+        PRIMARY KEY (url, topic_name),
+        FOREIGN KEY (first_message_id) REFERENCES messages(id)
+    )
+    """)
+
     conn.commit()
 
     # Migration: Add new columns to messages table
@@ -209,3 +224,120 @@ def get_from_scrape_cache(url: str) -> Optional[dict]:
         logger.error(f"Error fetching scraped content from DB: {e}")
 
     return None
+
+
+def check_url_indexed(url: str, topic_name: str) -> Optional[dict]:
+    """
+    Check if URL already indexed in topic.
+
+    Args:
+        url: The URL to check (will be normalized)
+        topic_name: Topic to check in
+
+    Returns:
+        Dict with indexed info + cached summary if found, None otherwise
+    """
+    from core.url_utils import normalize_url
+
+    normalized = normalize_url(url)
+    try:
+        with db_session() as cur:
+            cur.execute("""
+                SELECT
+                    iu.url, iu.original_url, iu.first_indexed_at,
+                    iu.times_shared, iu.last_seen_at,
+                    usc.summary, usc.scraped_at
+                FROM indexed_urls iu
+                LEFT JOIN url_scrape_cache usc ON iu.original_url = usc.url
+                WHERE iu.url = ? AND iu.topic_name = ?
+            """, (normalized, topic_name))
+            row = cur.fetchone()
+
+            if row:
+                return {
+                    'normalized_url': row[0],
+                    'original_url': row[1],
+                    'first_indexed_at': row[2],
+                    'times_shared': row[3],
+                    'last_seen_at': row[4],
+                    'summary': row[5],
+                    'scraped_at': row[6],
+                    'topic_name': topic_name
+                }
+    except Exception as e:
+        logger.error(f"Error checking indexed URL: {e}")
+
+    return None
+
+
+def mark_url_indexed(url: str, topic_name: str, message_id: int) -> None:
+    """
+    Mark URL as indexed (called by indexing worker).
+
+    Args:
+        url: The URL that was indexed
+        topic_name: Topic it was indexed in
+        message_id: ID of the message containing the URL
+    """
+    from core.url_utils import normalize_url
+
+    normalized = normalize_url(url)
+    now = datetime.now(UTC).isoformat()
+
+    try:
+        with db_session() as cur:
+            cur.execute("""
+                INSERT INTO indexed_urls
+                (url, original_url, topic_name, first_indexed_at, first_message_id, last_seen_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(url, topic_name) DO UPDATE SET
+                    last_seen_at = excluded.last_seen_at,
+                    times_shared = times_shared + 1
+            """, (normalized, url, topic_name, now, message_id, now))
+        logger.debug(f"Marked URL as indexed: {url} in {topic_name}")
+    except Exception as e:
+        logger.error(f"Error marking URL as indexed: {e}")
+
+
+def increment_url_share_count(url: str, topic_name: str) -> int:
+    """
+    Update when URL shared again (called by message handler).
+
+    Args:
+        url: The URL that was shared
+        topic_name: Topic it was shared in
+
+    Returns:
+        Updated share count, or 0 if URL not found
+    """
+    from core.url_utils import normalize_url
+
+    normalized = normalize_url(url)
+    now = datetime.now(UTC).isoformat()
+
+    try:
+        with db_session() as cur:
+            cur.execute("""
+                UPDATE indexed_urls
+                SET times_shared = times_shared + 1,
+                    last_seen_at = ?
+                WHERE url = ? AND topic_name = ?
+            """, (now, normalized, topic_name))
+
+            if cur.rowcount == 0:
+                logger.warning(f"Attempted to increment share count for non-existent URL: {url}")
+                return 0
+
+            # Get updated count
+            cur.execute("""
+                SELECT times_shared FROM indexed_urls
+                WHERE url = ? AND topic_name = ?
+            """, (normalized, topic_name))
+            row = cur.fetchone()
+            new_count = row[0] if row else 0
+
+            logger.debug(f"Incremented share count for {url} to {new_count}")
+            return new_count
+    except Exception as e:
+        logger.error(f"Error incrementing share count: {e}")
+        return 0

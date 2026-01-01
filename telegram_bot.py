@@ -350,6 +350,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ))
             db_message_id = cur.lastrowid
 
+        # --- DUPLICATE URL DETECTION ---
+        extracted_url = None
+        if text:
+            extracted_url = extract_first_link(text)
+            if extracted_url:
+                from core.database import check_url_indexed, increment_url_share_count
+
+                indexed_info = check_url_indexed(extracted_url, topic_name)
+                if indexed_info:
+                    # URL already indexed - notify user and skip agent processing
+                    # Increment and get updated count
+                    updated_count = increment_url_share_count(extracted_url, topic_name)
+
+                    # Handle None summary from failed cache lookup
+                    summary = indexed_info.get('summary') or 'No summary available'
+                    first_indexed = indexed_info.get('first_indexed_at', 'Unknown')
+                    if first_indexed != 'Unknown' and len(first_indexed) >= 10:
+                        first_indexed = first_indexed[:10]
+
+                    # Truncate long summaries
+                    if len(summary) > 500:
+                        summary = summary[:497] + "..."
+
+                    notification = (
+                        f"✅ *Already Indexed!*\n\n"
+                        f"📎 This link is already in the {topic_name} knowledge base.\n\n"
+                        f"📝 *Summary:*\n{summary}\n\n"
+                        f"📅 First indexed: {first_indexed}\n"
+                    )
+                    # Use updated count which includes current share
+                    if updated_count > 1:
+                        notification += f"🔄 Shared {updated_count} times in this topic"
+
+                    await msg.reply_text(notification, parse_mode='Markdown')
+                    logger.info(f"Duplicate URL detected: {extracted_url} in {topic_name}")
+                    return
+
         # --- AGENT ROUTING: Route to specialized agent based on topic ---
         if text:  # Only route text messages to agents
             logger.info(f"Routing message to agent for topic '{topic_name}'...")
@@ -367,7 +404,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             # Update database with extracted link and summary (for indexing worker)
-            extracted_url = extract_first_link(text)
+            # Reuse extracted_url from duplicate detection above
             if extracted_url:
                 # Get scraped content from cache (populated by web_scrape tool)
                 scraped_summary = None
