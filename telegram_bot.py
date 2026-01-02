@@ -10,6 +10,7 @@ Architecture (v2):
 - Background URL indexing
 """
 
+import gc
 import logging
 import re
 import asyncio
@@ -36,6 +37,26 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# ==========================================================
+# MEMORY OPTIMIZATION
+# ==========================================================
+
+# Enable aggressive garbage collection for low-memory environments
+gc.set_threshold(700, 10, 10)  # More aggressive than default (700, 10, 10)
+logger.info("Enabled aggressive garbage collection for memory optimization")
+
+def log_memory_usage(stage: str):
+    """Log current memory usage for debugging."""
+    try:
+        import psutil
+        import os
+        process = psutil.Process(os.getpid())
+        mem_info = process.memory_info()
+        logger.info(f"[Memory] {stage}: RSS={mem_info.rss / 1024 / 1024:.1f}MB, VMS={mem_info.vms / 1024 / 1024:.1f}MB")
+    except ImportError:
+        # psutil not available, skip logging
+        pass
 
 
 # ==========================================================
@@ -346,6 +367,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message_id=db_message_id,
             update_categories_func=update_message_categories
         )
+
+        # Force garbage collection after agent processing to free memory
+        gc.collect()
+        log_memory_usage("After agent processing")
 
         # Update with scraped summary if available
         if extracted_url:

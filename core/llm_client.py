@@ -25,10 +25,18 @@ def get_openai_client() -> OpenAI:
 
     if _client_instance is None:
         from core.config import config
+        import httpx
+
+        # Use custom httpx client with limited connection pool for memory efficiency
+        http_client = httpx.Client(
+            limits=httpx.Limits(max_connections=5, max_keepalive_connections=2),
+            timeout=60.0
+        )
 
         _client_instance = OpenAI(
             base_url=config.openrouter_base_url,
             api_key=config.openrouter_api_key,
+            http_client=http_client,
         )
         logger.info(f"Initialized OpenAI client for OpenRouter (model: {config.openrouter_model})")
 

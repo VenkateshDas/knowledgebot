@@ -7,6 +7,7 @@ All agents inherit from this class to get:
 - Agno agent creation and configuration
 """
 
+import gc
 import logging
 from typing import List, Optional
 from datetime import datetime
@@ -148,7 +149,7 @@ class BaseAgent:
 
             # Memory and session
             add_history_to_context=True,
-            num_history_runs=10,  # Last 10 message pairs
+            num_history_runs=5,  # Last 5 message pairs (reduced for memory efficiency)
             session_id=self.session_id,
             db=self.db,
 
@@ -222,11 +223,15 @@ class BaseAgent:
             # Clear RAG context
             clear_rag_context()
 
+            # Force garbage collection to free memory
+            gc.collect()
+
             return result
 
         except Exception as e:
             logger.error(f"{self.name} failed to process message: {e}", exc_info=True)
             clear_rag_context()  # Clear context even on error
+            gc.collect()  # Free memory even on error
             return "I encountered an error processing your message. Please try again."
 
     def clear_memory(self) -> bool:

@@ -57,7 +57,7 @@ class LRUCache:
 _scraped_content_cache = LRUCache(max_size=config.scrape_cache_max_size)
 
 
-def web_search(query: str, max_results: int = 6) -> str:
+def web_search(query: str, max_results: int = 4) -> str:
     """
     Perform a real web search using Parallel AI Search API.
 
@@ -93,7 +93,7 @@ def web_search(query: str, max_results: int = 6) -> str:
             "objective": query,
             "mode": "agentic",  # Fast, token-efficient mode for agents
             "max_results": max_results,
-            "max_chars_per_result": 800  # Balanced excerpt length
+            "max_chars_per_result": 600  # Reduced for memory efficiency
         }
 
         # Make API request with timeout
@@ -138,7 +138,7 @@ def web_search(query: str, max_results: int = 6) -> str:
             # Add excerpts (already optimized by Parallel AI)
             if excerpts:
                 formatted_output.append("Key excerpts:")
-                for excerpt in excerpts[:3]:  # Top 3 excerpts per result
+                for excerpt in excerpts[:2]:  # Top 2 excerpts per result (memory optimized)
                     # Handle both dict and string excerpt formats
                     if isinstance(excerpt, dict):
                         excerpt_text = excerpt.get("text", "").strip()
@@ -321,7 +321,7 @@ def web_scrape(url: str) -> str:
                 },
                 {
                     "role": "user",
-                    "content": markdown_content[:50000]
+                    "content": markdown_content[:30000]  # Reduced from 50k for memory efficiency
                 }
             ]
         )
