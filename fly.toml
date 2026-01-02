@@ -1,31 +1,26 @@
-# fly.toml app configuration file generated for telegram-exp on 2025-12-28T21:20:02+01:00
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
+# fly.toml - Telegram Knowledge Bot
+# Optimized for low memory footprint with hybrid retrieval
 
 app = 'telegram-exp'
 primary_region = 'fra'
 
 [build]
 
-# Remove http_service - Telegram bots use polling, not HTTP
-# This prevents the "not listening on port" warning
-
 [env]
-  # Non-sensitive environment variables
   DB_PATH = "/data/bot.db"
-  LIGHTRAG_WORKING_DIR = "/data/lightrag_data"
-  LIGHTRAG_PRODUCTION = "true"
-  LIGHTRAG_DEFAULT_MODE = "hybrid"
-  LIGHTRAG_TOP_K = "5"
+  RETRIEVAL_TOP_K = "5"
+  BM25_WEIGHT = "0.4"
+  VECTOR_WEIGHT = "0.6"
+  CACHE_SIMILARITY_THRESHOLD = "0.92"
+  CACHE_MAX_ENTRIES = "500"
+  CACHE_TTL_HOURS = "24"
   INDEXING_POLL_INTERVAL = "10"
-  INDEXING_BATCH_SIZE = "10"
+  INDEXING_BATCH_SIZE = "5"
 
 [[vm]]
+  memory_mb = 256
   cpus = 1
-  memory_mb = 512
 
-# Persistent volume for SQLite database
 [[mounts]]
   source = "bot_data"
   destination = "/data"

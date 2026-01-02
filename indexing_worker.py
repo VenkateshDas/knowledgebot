@@ -1,98 +1,81 @@
 """
-Indexing Worker - Background worker for automatic URL content indexing.
+Indexing Worker - Background URL content indexing.
 
-Monitors the messages table for new URLs and indexes them to LightRAG.
-User messages are indexed only via agent decisions (knowledge_index tool).
+Simplified version using HybridRetriever (no LightRAG).
+Polls for new URLs and indexes them in batches.
 """
 
 import logging
 import asyncio
 from datetime import datetime, timedelta, UTC
-from typing import Optional
+from typing import Optional, List, Dict
 
 from core.config import config
-from core.database import db_session
-from lightrag_manager import get_lightrag_manager
+from core.database import db_session, mark_url_indexed
 from tools.common_tools import get_scraped_content
+from tools.rag_tools import index_url_content
 
 logger = logging.getLogger(__name__)
 
 
-class URLIndexingWorker:
+class IndexingWorker:
     """
-    Background worker that automatically indexes URL content to LightRAG.
+    Background worker for automatic URL indexing.
 
-    Only handles URLs - user messages are indexed via agent decisions only.
+    Polls database for URLs with summaries and indexes them
+    to the knowledge base in batches.
     """
 
     def __init__(self):
-        """Initialize the indexing worker."""
-        self.lightrag_manager = get_lightrag_manager()
+        """Initialize the worker."""
         self.is_running = False
-        self._task: Optional[asyncio.Task] = None
-        logger.info("URLIndexingWorker initialized")
+        self.poll_interval = config.indexing_poll_interval
+        self.batch_size = config.indexing_batch_size
+        logger.info("IndexingWorker initialized")
 
     async def start(self):
-        """
-        Start the background indexing worker.
-
-        Polls database for unindexed URLs and processes them.
-        """
+        """Start the background worker."""
         if self.is_running:
-            logger.warning("Indexing worker already running")
+            logger.warning("Worker already running")
             return
 
         self.is_running = True
-        logger.info("Starting URL indexing worker...")
+        logger.info("Starting IndexingWorker...")
 
         while self.is_running:
             try:
-                await self._process_pending_urls()
-                await asyncio.sleep(config.indexing_poll_interval)
+                await self._process_batch()
+                await asyncio.sleep(self.poll_interval)
             except Exception as e:
-                logger.error(f"Error in indexing worker loop: {e}", exc_info=True)
-                await asyncio.sleep(config.indexing_poll_interval * 2)  # Back off on error
+                logger.error(f"Worker error: {e}", exc_info=True)
+                await asyncio.sleep(self.poll_interval * 2)
 
     def stop(self):
-        """Stop the background indexing worker."""
-        logger.info("Stopping URL indexing worker...")
+        """Stop the worker."""
+        logger.info("Stopping IndexingWorker...")
         self.is_running = False
 
-    async def _process_pending_urls(self):
-        """Process pending URLs that need indexing."""
+    async def _process_batch(self):
+        """Process a batch of pending URLs."""
+        pending = self._get_pending_urls()
+
+        if not pending:
+            return
+
+        logger.info(f"Processing {len(pending)} URLs")
+
+        for url_data in pending:
+            try:
+                await self._index_url(url_data)
+            except Exception as e:
+                logger.error(f"Failed to index {url_data['url']}: {e}")
+
+    def _get_pending_urls(self) -> List[Dict]:
+        """Get URLs pending indexing."""
+        # Only process recent URLs (last 24 hours)
+        cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
+
         try:
-            # Get unindexed URLs from database
-            pending_urls = self._get_pending_urls()
-
-            if not pending_urls:
-                return
-
-            logger.info(f"Found {len(pending_urls)} URLs to index")
-
-            for url_data in pending_urls:
-                try:
-                    await self._index_url(url_data)
-                except Exception as e:
-                    logger.error(f"Failed to index URL {url_data['url']}: {e}", exc_info=True)
-
-        except Exception as e:
-            logger.error(f"Error processing pending URLs: {e}", exc_info=True)
-
-    def _get_pending_urls(self) -> list:
-        """
-        Get URLs that need to be indexed.
-
-        Only processes URLs from messages created in the last 24 hours to avoid
-        re-indexing historical data.
-
-        Returns:
-            List of dicts with URL data
-        """
-        try:
-            # Only process URLs from the last 24 hours
-            cutoff_time = datetime.now(UTC) - timedelta(hours=24)
-            cutoff_iso = cutoff_time.isoformat()
-
             with db_session() as cur:
                 cur.execute("""
                     SELECT id, topic_name, extracted_link, username, created_at, summary
@@ -104,194 +87,77 @@ class URLIndexingWorker:
                       AND created_at >= ?
                     ORDER BY created_at DESC
                     LIMIT ?
-                """, (cutoff_iso, config.indexing_batch_size))
-
-                rows = cur.fetchall()
+                """, (cutoff, self.batch_size))
 
                 return [
                     {
                         "message_id": row[0],
-                        "topic_name": row[1],
+                        "topic": row[1],
                         "url": row[2],
                         "username": row[3] or "unknown",
                         "timestamp": row[4],
                         "summary": row[5]
                     }
-                    for row in rows
+                    for row in cur.fetchall()
                 ]
-
         except Exception as e:
             logger.error(f"Error fetching pending URLs: {e}")
             return []
 
-    async def _index_url(self, url_data: dict):
-        """
-        Index a URL to LightRAG.
-
-        Args:
-            url_data: Dictionary with URL information
-        """
+    async def _index_url(self, url_data: Dict):
+        """Index a single URL."""
         url = url_data["url"]
-        topic_name = url_data["topic_name"]
+        topic = url_data["topic"]
         message_id = url_data["message_id"]
-        username = url_data["username"]
-        timestamp = url_data["timestamp"]
-        summary = url_data["summary"]
 
-        logger.info(f"Indexing URL for topic '{topic_name}': {url}")
-
-        # Check if URL already indexed in this topic
-        from core.database import check_url_indexed, mark_url_indexed
-
-        if check_url_indexed(url, topic_name):
-            logger.info(f"Skipping duplicate URL: {url} in topic {topic_name}")
-            self._mark_as_indexed(message_id, "duplicate")
+        # Check if already indexed
+        from core.database import check_url_indexed
+        if check_url_indexed(url, topic):
+            logger.info(f"Skipping duplicate: {url}")
+            self._mark_indexed(message_id, "duplicate")
             return
 
-        # Try to get cached content first
-        scraped_data = get_scraped_content(url)
-
-        if not scraped_data or not scraped_data.get("full_content"):
-            logger.warning(f"No cached content found for {url}, skipping for now")
-            # Don't mark as failed - it might get scraped later
+        # Get cached content
+        scraped = get_scraped_content(url)
+        if not scraped or not scraped.get("full_content"):
+            logger.warning(f"No cached content for {url}")
             return
 
-        full_content = scraped_data["full_content"]
-        if not summary and scraped_data.get("summary"):
-            summary = scraped_data["summary"]
-
-        # Index to LightRAG
-        success = await self.lightrag_manager.index_url_content(
-            topic_name=topic_name,
+        # Index to knowledge base
+        success = index_url_content(
+            topic=topic,
             url=url,
-            content=full_content,
-            summary=summary or "No summary available",
-            timestamp=timestamp,
-            username=username
+            content=scraped["full_content"],
+            summary=url_data["summary"] or scraped.get("summary", ""),
+            username=url_data["username"],
+            message_id=message_id
         )
 
         if success:
-            # Mark as indexed in database
-            self._mark_as_indexed(message_id, "auto_url")
-            # Track in indexed_urls table
-            mark_url_indexed(url, topic_name, message_id)
-            logger.info(f"Successfully indexed URL: {url}")
-        else:
-            logger.error(f"Failed to index URL: {url}")
+            self._mark_indexed(message_id, "auto_url")
+            mark_url_indexed(url, topic, message_id)
+            logger.info(f"Indexed: {url}")
 
-    def _mark_as_indexed(self, message_id: int, indexed_by: str):
-        """
-        Mark a message as indexed in the database.
-
-        Args:
-            message_id: Database message ID
-            indexed_by: Who/what indexed it ("auto_url" or "agent_decision")
-        """
+    def _mark_indexed(self, message_id: int, indexed_by: str):
+        """Mark message as indexed in database."""
         try:
             with db_session() as cur:
                 cur.execute("""
                     UPDATE messages
-                    SET indexed_to_rag = 1,
-                        indexed_at = ?,
-                        indexed_by = ?
+                    SET indexed_to_rag = 1, indexed_at = ?, indexed_by = ?
                     WHERE id = ?
                 """, (datetime.now(UTC).isoformat(), indexed_by, message_id))
-
-                logger.debug(f"Marked message {message_id} as indexed ({indexed_by})")
-
         except Exception as e:
-            logger.error(f"Error marking message as indexed: {e}")
-
-    async def backfill_urls(self, topic_name: Optional[str] = None, limit: int = 100):
-        """
-        Backfill historical URLs.
-
-        Args:
-            topic_name: Optional topic filter
-            limit: Maximum number of URLs to backfill
-        """
-        logger.info(f"Starting URL backfill (topic={topic_name}, limit={limit})")
-
-        try:
-            # Get historical URLs
-            with db_session() as cur:
-                if topic_name:
-                    cur.execute("""
-                        SELECT id, topic_name, extracted_link, username, created_at, summary
-                        FROM messages
-                        WHERE extracted_link IS NOT NULL
-                          AND topic_name = ?
-                          AND (indexed_to_rag IS NULL OR indexed_to_rag = 0)
-                        ORDER BY created_at ASC
-                        LIMIT ?
-                    """, (topic_name, limit))
-                else:
-                    cur.execute("""
-                        SELECT id, topic_name, extracted_link, username, created_at, summary
-                        FROM messages
-                        WHERE extracted_link IS NOT NULL
-                          AND (indexed_to_rag IS NULL OR indexed_to_rag = 0)
-                        ORDER BY created_at ASC
-                        LIMIT ?
-                    """, (limit,))
-
-                rows = cur.fetchall()
-
-                urls_to_backfill = [
-                    {
-                        "message_id": row[0],
-                        "topic_name": row[1],
-                        "url": row[2],
-                        "username": row[3] or "unknown",
-                        "timestamp": row[4],
-                        "summary": row[5]
-                    }
-                    for row in rows
-                ]
-
-            logger.info(f"Found {len(urls_to_backfill)} URLs to backfill")
-
-            # Process each URL
-            for i, url_data in enumerate(urls_to_backfill, 1):
-                try:
-                    logger.info(f"Backfilling {i}/{len(urls_to_backfill)}: {url_data['url']}")
-                    await self._index_url(url_data)
-                    await asyncio.sleep(0.5)  # Small delay to avoid rate limiting
-                except Exception as e:
-                    logger.error(f"Error backfilling URL {url_data['url']}: {e}")
-
-            logger.info(f"Backfill complete: processed {len(urls_to_backfill)} URLs")
-
-        except Exception as e:
-            logger.error(f"Error in backfill: {e}", exc_info=True)
+            logger.error(f"Error marking indexed: {e}")
 
 
-# Global worker instance
-_worker_instance: Optional[URLIndexingWorker] = None
+# Singleton
+_worker: Optional[IndexingWorker] = None
 
 
-def get_indexing_worker() -> URLIndexingWorker:
-    """
-    Get global indexing worker instance (singleton).
-
-    Returns:
-        URLIndexingWorker instance
-    """
-    global _worker_instance
-
-    if _worker_instance is None:
-        _worker_instance = URLIndexingWorker()
-
-    return _worker_instance
-
-
-async def start_indexing_worker():
-    """Start the global indexing worker."""
-    worker = get_indexing_worker()
-    await worker.start()
-
-
-def stop_indexing_worker():
-    """Stop the global indexing worker."""
-    if _worker_instance:
-        _worker_instance.stop()
+def get_indexing_worker() -> IndexingWorker:
+    """Get global worker instance."""
+    global _worker
+    if _worker is None:
+        _worker = IndexingWorker()
+    return _worker

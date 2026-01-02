@@ -1,7 +1,7 @@
 [project]
 name = "telegram-exp"
-version = "0.1.0"
-description = "A Telegram bot project"
+version = "0.2.0"
+description = "A Telegram knowledge bot with hybrid retrieval"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -11,18 +11,7 @@ dependencies = [
     "requests>=2.31.0",
     "agno>=0.9.0",
     "sqlalchemy>=2.0.0",
-    "lightrag-hku>=0.0.1",
-    "nano-vectordb>=0.0.4",  # Dev mode only
-    "networkx>=3.0",  # Dev mode only
-]
-
-[project.optional-dependencies]
-# Production database dependencies
-production = [
-    "psycopg2-binary>=2.9.9",  # PostgreSQL adapter
-    "asyncpg>=0.29.0",  # Async PostgreSQL for LightRAG
-    "pgvector>=0.2.0",  # pgvector Python library for vector operations
-    "neo4j>=5.15.0",  # Neo4j graph database
+    "numpy>=1.26.0",
 ]
 
 [tool.uv]

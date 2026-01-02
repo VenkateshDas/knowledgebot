@@ -2,7 +2,12 @@
 """
 Main Telegram bot application.
 
-Handles message routing to specialized agents and topic management.
+Architecture (v2):
+- Immediate ACK for URLs (non-blocking)
+- Semantic caching for repeated queries
+- Query routing for model selection
+- Hybrid retrieval (BM25 + Vector)
+- Background URL indexing
 """
 
 import logging
@@ -13,14 +18,13 @@ from datetime import datetime, UTC
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, CommandHandler, filters
 
-# Core modules (centralized config, database, LLM client)
 from core.config import config
-from core.database import db_session, init_db
+from core.database import db_session, init_db, check_url_indexed, increment_url_share_count
+from core.retriever import get_retriever
+from core.cache import get_cache
+from core.router import get_query_router, QueryComplexity
 
-# Import agent router
 from agent_router import get_router
-
-# Import indexing worker
 from indexing_worker import get_indexing_worker
 
 # ==========================================================
@@ -38,20 +42,12 @@ logger = logging.getLogger(__name__)
 # HELPERS
 # ==========================================================
 
-def escape_markdown(text):
-    """Escape special characters for Telegram MarkdownV2."""
-    if not text:
-        return text
-    # Characters that need to be escaped in MarkdownV2
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
-    return ''.join(f'\\{char}' if char in escape_chars else char for char in text)
-
 def build_message_link(chat, message_id):
     if chat.username:
         return f"https://t.me/{chat.username}/{message_id}"
-
     internal_id = abs(chat.id) - 1000000000000
     return f"https://t.me/c/{internal_id}/{message_id}"
+
 
 def save_topic(chat_id, thread_id, topic_name):
     with db_session() as cur:
@@ -60,6 +56,7 @@ def save_topic(chat_id, thread_id, topic_name):
         (chat_id, thread_id, topic_name, updated_at)
         VALUES (?, ?, ?, ?)
         """, (chat_id, thread_id, topic_name, datetime.now(UTC).isoformat()))
+
 
 def get_topic_name(chat_id, thread_id):
     if thread_id is None:
@@ -73,23 +70,14 @@ def get_topic_name(chat_id, thread_id):
         row = cur.fetchone()
 
     if row:
-        topic = row[0]
-        logger.info(f"Lookup topic for thread {thread_id}: {topic}")
-        return topic
+        return row[0]
 
-    # Unknown topic - use fallback
-    topic = f"Topic_{thread_id}"
-    logger.warning(
-        f"Unknown topic for thread {thread_id} in chat {chat_id}. "
-        f"Using fallback name '{topic}'."
-    )
-    return topic
+    return f"Topic_{thread_id}"
+
 
 def is_topic_initialized(chat_id, thread_id):
-    """Check if a topic is in the database."""
     if thread_id is None:
         return True
-
     with db_session() as cur:
         cur.execute("""
         SELECT 1 FROM topics
@@ -97,31 +85,27 @@ def is_topic_initialized(chat_id, thread_id):
         """, (chat_id, thread_id))
         return cur.fetchone() is not None
 
+
 def should_notify_unknown_topic(chat_id, thread_id):
-    """Check if we should send a notification about an unknown topic."""
     if thread_id is None:
         return False
-
-    # Check if the topic exists at all (either with real name or placeholder)
     with db_session() as cur:
         cur.execute("""
         SELECT 1 FROM topics
         WHERE chat_id = ? AND thread_id = ?
         """, (chat_id, thread_id))
-        topic_exists = cur.fetchone() is not None
+        return cur.fetchone() is None
 
-    # Only notify if topic doesn't exist at all
-    return not topic_exists
 
 def mark_topic_as_notified(chat_id, thread_id):
-    """Mark that we've notified about this unknown topic."""
-    placeholder_name = f"Topic_{thread_id}"
+    placeholder = f"Topic_{thread_id}"
     with db_session() as cur:
         cur.execute("""
         INSERT OR IGNORE INTO topics
         (chat_id, thread_id, topic_name, updated_at)
         VALUES (?, ?, ?, ?)
-        """, (chat_id, thread_id, placeholder_name, datetime.now(UTC).isoformat()))
+        """, (chat_id, thread_id, placeholder, datetime.now(UTC).isoformat()))
+
 
 def parse_message(msg):
     msg_type = "text"
@@ -134,17 +118,14 @@ def parse_message(msg):
         media = msg.photo[-1]
         file_id = media.file_id
         file_uid = media.file_unique_id
-
     elif msg.video:
         msg_type = "video"
         file_id = msg.video.file_id
         file_uid = msg.video.file_unique_id
-
     elif msg.document:
         msg_type = "document"
         file_id = msg.document.file_id
         file_uid = msg.document.file_unique_id
-
     elif msg.voice:
         msg_type = "voice"
         file_id = msg.voice.file_id
@@ -153,21 +134,7 @@ def parse_message(msg):
     return msg_type, text, file_id, file_uid
 
 
-def update_message_categories(message_id, primary_category, secondary_tags):
-    """Update message with categorization results."""
-    try:
-        with db_session() as cur:
-            cur.execute(
-                "UPDATE messages SET primary_category = ?, secondary_tags = ? WHERE id = ?",
-                (primary_category, secondary_tags, message_id)
-            )
-        logger.info(f"Updated categories for message {message_id}")
-    except Exception as e:
-        logger.error(f"Failed to update categories: {e}")
-
-
 def extract_first_link(text):
-    """Extract the first URL from text."""
     if not text:
         return None
     url_pattern = r'(https?://[^\s]+)'
@@ -175,95 +142,77 @@ def extract_first_link(text):
     return match.group(0) if match else None
 
 
+def update_message_categories(message_id, primary_category, secondary_tags):
+    try:
+        with db_session() as cur:
+            cur.execute(
+                "UPDATE messages SET primary_category = ?, secondary_tags = ? WHERE id = ?",
+                (primary_category, secondary_tags, message_id)
+            )
+    except Exception as e:
+        logger.error(f"Failed to update categories: {e}")
+
+
 # ==========================================================
 # COMMAND HANDLERS
 # ==========================================================
 
 async def name_topic_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command to manually set the name for the current topic."""
+    """Command to set the name for the current topic."""
     try:
         msg = update.message
         chat_id = msg.chat.id
         thread_id = msg.message_thread_id
 
         if thread_id is None:
-            await msg.reply_text("⚠️ This command only works in forum topics, not in the general chat.")
+            await msg.reply_text("This command only works in forum topics.")
             return
 
-        # Get the topic name from command arguments
         if not context.args:
-            await msg.reply_text(
-                "Usage: /name_topic <topic_name>\n\n"
-                "Example: /name_topic AI Engineering"
-            )
+            await msg.reply_text("Usage: /name_topic <topic_name>\nExample: /name_topic AI Engineering")
             return
 
         topic_name = " ".join(context.args)
-
-        # Save to database
         save_topic(chat_id, thread_id, topic_name)
-        logger.info(f"Manually set topic name for thread {thread_id}: {topic_name}")
-
-        await msg.reply_text(f"✅ Topic set to: '{topic_name}'")
+        logger.info(f"Set topic name for thread {thread_id}: {topic_name}")
+        await msg.reply_text(f"Topic set to: '{topic_name}'")
 
     except Exception as e:
         logger.exception("Error in name_topic command")
         await msg.reply_text(f"Error: {str(e)}")
 
-async def check_topics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command to check and list unknown topics that need initialization."""
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show knowledge base and cache statistics."""
     try:
-        chat_id = update.effective_chat.id
+        retriever = get_retriever()
+        cache = get_cache()
 
-        with db_session() as cur:
-            # Get all unique thread_ids from messages
-            cur.execute("""
-                SELECT DISTINCT thread_id
-                FROM messages
-                WHERE chat_id = ? AND thread_id IS NOT NULL
-            """, (chat_id,))
-            message_threads = {row[0] for row in cur.fetchall()}
+        retriever_stats = retriever.get_stats()
+        cache_stats = cache.get_stats()
 
-            # Get known topics
-            cur.execute("""
-                SELECT thread_id, topic_name
-                FROM topics
-                WHERE chat_id = ?
-            """, (chat_id,))
-            known_topics = {row[0]: row[1] for row in cur.fetchall()}
-
-        # Find unknown threads
-        unknown_threads = message_threads - set(known_topics.keys())
-
-        if not unknown_threads:
-            await update.message.reply_text(
-                "✅ All topics are properly initialized!\n\n"
-                f"Known topics: {len(known_topics)}"
-            )
-        else:
-            response = (
-                f"⚠️ Found {len(unknown_threads)} unknown topic(s):\n\n"
-                f"Thread IDs: {', '.join(map(str, sorted(unknown_threads)))}\n\n"
-                "To fix this:\n"
-                "1. Go to each topic in Telegram\n"
-                "2. Edit the topic name (you can keep the same name)\n"
-                "3. Save it - this will trigger an update for the bot\n\n"
-                f"Known topics ({len(known_topics)}):\n"
-            )
-            for tid, name in sorted(known_topics.items()):
-                response += f"  • Thread {tid}: {name}\n"
-
-            await update.message.reply_text(response)
+        stats_text = (
+            f"Knowledge Base Stats:\n"
+            f"  Total chunks: {retriever_stats['total_chunks']}\n"
+            f"  Vectors in memory: {retriever_stats['vectors_in_memory']}\n\n"
+            f"Cache Stats:\n"
+            f"  Total entries: {cache_stats['total_entries']}\n"
+            f"  Total hits: {cache_stats['total_hits']}\n"
+            f"  By topic: {cache_stats['by_topic']}"
+        )
+        await update.message.reply_text(stats_text)
 
     except Exception as e:
-        logger.exception("Error in check_topics command")
+        logger.exception("Error in stats command")
         await update.message.reply_text(f"Error: {str(e)}")
+
 
 # ==========================================================
 # MESSAGE HANDLER
 # ==========================================================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Main message handler with optimized pipeline."""
     try:
         msg = update.message
         if not msg:
@@ -271,58 +220,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         chat = msg.chat
         user = msg.from_user
-        user_info = f"User: {user.username} ({user.id})" if user else "User: Unknown"
-        chat_info = f"Chat: {chat.title or chat.username} ({chat.id})"
-        thread_info = f"Thread: {msg.message_thread_id}" if msg.message_thread_id else "No Thread"
-        
-        logger.info(f"Received update: {chat_info} | {thread_info} | {user_info}")
-
-        # Topic created (auto-register new topics)
-        if msg.forum_topic_created:
-            topic_name = msg.forum_topic_created.name
-            thread_id = msg.message_thread_id
-            logger.info(f"Topic created: '{topic_name}' (thread {thread_id}) in chat {chat.id}")
-            save_topic(chat.id, thread_id, topic_name)
-            await msg.reply_text(
-                f"✅ Topic '{topic_name}' registered!\n\n"
-                f"Use /name_topic to change the name if needed."
-            )
-            return
-
-        # Topic edited (note: bot needs admin permissions to receive these events)
-        if msg.forum_topic_edited:
-            topic_name = msg.forum_topic_edited.name
-            thread_id = msg.message_thread_id
-            logger.info(f"Topic edited: '{topic_name}' (thread {thread_id}) in chat {chat.id}")
-            save_topic(chat.id, thread_id, topic_name)
-            await msg.reply_text(f"✅ Topic renamed to '{topic_name}'")
-            return
-
         thread_id = msg.message_thread_id
 
-        # Check if topic is unknown and needs initialization
+        # Log incoming message
+        logger.info(f"Message from {user.username or user.id} in {chat.title or chat.id}")
+
+        # Handle topic events
+        if msg.forum_topic_created:
+            topic_name = msg.forum_topic_created.name
+            save_topic(chat.id, thread_id, topic_name)
+            await msg.reply_text(f"Topic '{topic_name}' registered!")
+            return
+
+        if msg.forum_topic_edited:
+            topic_name = msg.forum_topic_edited.name
+            save_topic(chat.id, thread_id, topic_name)
+            await msg.reply_text(f"Topic renamed to '{topic_name}'")
+            return
+
+        # Unknown topic notification
         if should_notify_unknown_topic(chat.id, thread_id):
-            logger.info(f"Unknown topic detected (thread {thread_id}). Sending setup notification.")
             await msg.reply_text(
-                "⚠️ This topic hasn't been named yet.\n\n"
-                "To set a name, use:\n"
-                "/name_topic <your topic name>\n\n"
-                "Example:\n"
-                "/name_topic AI Engineering\n\n"
-                "You only need to do this once per topic."
+                "This topic hasn't been named yet.\n"
+                "Use: /name_topic <name>\n"
+                "Example: /name_topic AI Engineering"
             )
             mark_topic_as_notified(chat.id, thread_id)
 
         topic_name = get_topic_name(chat.id, thread_id)
-
         msg_type, text, file_id, file_uid = parse_message(msg)
         link = build_message_link(chat, msg.message_id)
 
         user_id = user.id if user else None
         username = user.username if user else None
 
-        logger.info(f"Saving message: type={msg_type}, topic='{topic_name}', user={username}")
-        
+        # Save message to database
         db_message_id = None
         with db_session() as cur:
             cur.execute("""
@@ -335,124 +267,117 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                chat.id,
-                thread_id,
-                topic_name,
-                msg.message_id,
-                user_id,
-                username,
-                msg_type,
-                text,
-                file_id,
-                file_uid,
-                link,
-                datetime.now(UTC).isoformat()
+                chat.id, thread_id, topic_name,
+                msg.message_id, user_id, username,
+                msg_type, text,
+                file_id, file_uid,
+                link, datetime.now(UTC).isoformat()
             ))
             db_message_id = cur.lastrowid
 
+        # Non-text messages: simple acknowledgment
+        if not text:
+            await msg.reply_text("Saved!")
+            return
+
+        # Check for URL
+        extracted_url = extract_first_link(text)
+
         # --- DUPLICATE URL DETECTION ---
-        extracted_url = None
-        if text:
-            extracted_url = extract_first_link(text)
-            if extracted_url:
-                from core.database import check_url_indexed, increment_url_share_count
+        if extracted_url:
+            indexed_info = check_url_indexed(extracted_url, topic_name)
+            if indexed_info:
+                updated_count = increment_url_share_count(extracted_url, topic_name)
+                summary = indexed_info.get('summary') or 'No summary available'
+                if len(summary) > 500:
+                    summary = summary[:497] + "..."
 
-                indexed_info = check_url_indexed(extracted_url, topic_name)
-                if indexed_info:
-                    # URL already indexed - notify user and skip agent processing
-                    # Increment and get updated count
-                    updated_count = increment_url_share_count(extracted_url, topic_name)
+                notification = (
+                    f"Already Indexed!\n\n"
+                    f"This link is in the {topic_name} knowledge base.\n\n"
+                    f"Summary:\n{summary}\n"
+                )
+                if updated_count > 1:
+                    notification += f"\nShared {updated_count} times in this topic"
 
-                    # Handle None summary from failed cache lookup
-                    summary = indexed_info.get('summary') or 'No summary available'
-                    first_indexed = indexed_info.get('first_indexed_at', 'Unknown')
-                    if first_indexed != 'Unknown' and len(first_indexed) >= 10:
-                        first_indexed = first_indexed[:10]
+                await msg.reply_text(notification)
+                return
 
-                    # Truncate long summaries
-                    if len(summary) > 500:
-                        summary = summary[:497] + "..."
+        # --- QUERY ROUTING ---
+        query_router = get_query_router()
+        route_result = query_router.route(text, has_url=bool(extracted_url))
 
-                    notification = (
-                        f"✅ *Already Indexed!*\n\n"
-                        f"📎 This link is already in the {topic_name} knowledge base.\n\n"
-                        f"📝 *Summary:*\n{summary}\n\n"
-                        f"📅 First indexed: {first_indexed}\n"
-                    )
-                    # Use updated count which includes current share
-                    if updated_count > 1:
-                        notification += f"🔄 Shared {updated_count} times in this topic"
+        # Handle instant responses (greetings, acknowledgments)
+        if route_result.complexity == QueryComplexity.INSTANT:
+            await msg.reply_text(route_result.template_response)
+            return
 
-                    await msg.reply_text(notification, parse_mode='Markdown')
-                    logger.info(f"Duplicate URL detected: {extracted_url} in {topic_name}")
-                    return
+        # --- SEMANTIC CACHE CHECK ---
+        cache = get_cache()
+        cached_response = cache.get(text, topic_name)
 
-        # --- AGENT ROUTING: Route to specialized agent based on topic ---
-        if text:  # Only route text messages to agents
-            logger.info(f"Routing message to agent for topic '{topic_name}'...")
+        if cached_response:
+            logger.info(f"Cache HIT for message {msg.message_id}")
+            await msg.reply_text(cached_response)
+            return
 
-            # Get router and route message
-            router = get_router()
-            response_text, primary_cat, secondary_tags = await router.route_message(
-                topic_name=topic_name,
-                user_id=user_id,
-                chat_id=chat.id,
-                thread_id=thread_id,
-                text=text,
-                message_id=db_message_id,
-                update_categories_func=update_message_categories
-            )
+        # --- URL HANDLING: Immediate ACK + Background Processing ---
+        if extracted_url:
+            # Send immediate acknowledgment
+            await msg.reply_text("Got it! Processing the link...")
 
-            # Update database with extracted link and summary (for indexing worker)
-            # Reuse extracted_url from duplicate detection above
-            if extracted_url:
-                # Get scraped content from cache (populated by web_scrape tool)
-                scraped_summary = None
-                try:
-                    # Check url_scrape_cache table for the summary
-                    with db_session() as cur:
-                        cur.execute(
-                            "SELECT summary FROM url_scrape_cache WHERE url = ?",
-                            (extracted_url,)
-                        )
-                        row = cur.fetchone()
-                        if row:
-                            scraped_summary = row[0]
-                            logger.debug(f"Found cached summary for {extracted_url}")
-                except Exception as e:
-                    logger.error(f"Error fetching summary from cache: {e}")
+            # Update database with URL
+            with db_session() as cur:
+                cur.execute(
+                    "UPDATE messages SET extracted_link = ? WHERE id = ?",
+                    (extracted_url, db_message_id)
+                )
 
-                # Update messages table with link and summary
+        # --- AGENT ROUTING ---
+        logger.info(f"Routing to agent for topic '{topic_name}' (complexity: {route_result.complexity.value})")
+
+        router = get_router()
+        response_text, primary_cat, secondary_tags = await router.route_message(
+            topic_name=topic_name,
+            user_id=user_id,
+            chat_id=chat.id,
+            thread_id=thread_id,
+            text=text,
+            message_id=db_message_id,
+            update_categories_func=update_message_categories
+        )
+
+        # Update with scraped summary if available
+        if extracted_url:
+            try:
                 with db_session() as cur:
-                    if scraped_summary:
+                    cur.execute(
+                        "SELECT summary FROM url_scrape_cache WHERE url = ?",
+                        (extracted_url,)
+                    )
+                    row = cur.fetchone()
+                    if row and row[0]:
                         cur.execute(
-                            "UPDATE messages SET extracted_link = ?, summary = ? WHERE id = ?",
-                            (extracted_url, scraped_summary, db_message_id)
+                            "UPDATE messages SET summary = ? WHERE id = ?",
+                            (row[0], db_message_id)
                         )
-                        logger.info(f"Updated message {db_message_id} with URL and summary")
-                    else:
-                        cur.execute(
-                            "UPDATE messages SET extracted_link = ? WHERE id = ?",
-                            (extracted_url, db_message_id)
-                        )
-                        logger.info(f"Updated message {db_message_id} with URL (summary not yet available)")
+            except Exception as e:
+                logger.error(f"Error updating summary: {e}")
 
-            # Send agent response directly (agent handles link summarization via web_scrape tool)
-            logger.info(f"Successfully processed message {msg.message_id}")
+        # Send response
+        if response_text and response_text.strip():
+            await msg.reply_text(response_text)
 
-            # Safety check: Ensure response is not empty
-            if response_text and response_text.strip():
-                await msg.reply_text(response_text)
-            else:
-                logger.warning(f"Agent returned empty response for message {msg.message_id}")
-                await msg.reply_text("✅ Got it! I'm processing this information.")
-
+            # Cache successful responses (except for URL-specific responses)
+            if not extracted_url:
+                cache.set(text, response_text, topic_name)
         else:
-            # Non-text message (photos, videos, etc.) - simple acknowledgment
-            await msg.reply_text("✅ Saved!")
+            logger.warning(f"Empty response for message {msg.message_id}")
+            await msg.reply_text("Got it! I'm processing this information.")
 
     except Exception:
         logger.exception("Failed to process message")
+
 
 # ==========================================================
 # ENTRYPOINT
@@ -462,31 +387,31 @@ def main():
     init_db()
 
     async def post_init(application):
-        """Post-initialization hook to start background tasks."""
-        # Set main event loop reference for RAG tools
-        # This is required for asyncpg connection pools in production mode
-        from tools.rag_tools import set_main_loop
-        loop = asyncio.get_running_loop()
-        set_main_loop(loop)
+        """Post-initialization: start background workers."""
+        logger.info("Starting background workers...")
 
-        # Pre-initialize LightRAG instances for faster first queries
-        # This avoids 7+ second initialization delay on first message
-        from lightrag_manager import warm_up_lightrag
-        logger.info("Warming up LightRAG instances...")
-        await warm_up_lightrag()
+        # Initialize retriever (creates schema if needed)
+        retriever = get_retriever()
+        logger.info(f"Retriever initialized: {retriever.get_stats()}")
 
-        # Start URL indexing worker in background
-        indexing_worker = get_indexing_worker()
-        asyncio.create_task(indexing_worker.start())
-        logger.info("Bot is running with RAG indexing worker")
+        # Initialize cache
+        cache = get_cache()
+        cache.cleanup_expired()
+        logger.info(f"Cache initialized: {cache.get_stats()}")
+
+        # Start indexing worker
+        worker = get_indexing_worker()
+        asyncio.create_task(worker.start())
+
+        logger.info("Bot is running with hybrid retrieval")
 
     app = ApplicationBuilder().token(config.telegram_bot_token).post_init(post_init).build()
 
     # Command handlers
     app.add_handler(CommandHandler("name_topic", name_topic_command))
-    app.add_handler(CommandHandler("check_topics", check_topics_command))
+    app.add_handler(CommandHandler("stats", stats_command))
 
-    # Message handler (must be last to not intercept commands)
+    # Message handler
     app.add_handler(
         MessageHandler(
             filters.ALL & ~filters.StatusUpdate.ALL,
@@ -495,6 +420,7 @@ def main():
     )
 
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()

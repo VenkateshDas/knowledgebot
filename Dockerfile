@@ -15,17 +15,14 @@ ENV PYTHONUNBUFFERED=1 \
 # Copy dependency files
 COPY pyproject.toml uv.lock ./
 
-# Install dependencies using uv (including production extras for database support)
-RUN uv sync --frozen --no-dev --extra production
+# Install dependencies using uv
+RUN uv sync --frozen --no-dev
 
 # Copy application code
 COPY . .
 
 # Create directory for SQLite database
 RUN mkdir -p /data
-
-# Expose port (not strictly necessary for Telegram bots, but good practice)
-EXPOSE 8080
 
 # Run the bot
 CMD ["uv", "run", "python", "telegram_bot.py"]

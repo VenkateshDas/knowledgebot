@@ -33,17 +33,26 @@ class Config:
     openrouter_model: str = field(default_factory=lambda: os.getenv("OPENROUTER_MODEL", "minimax/minimax-m2.1"))
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
 
+    # Model routing (fast model for simple tasks, powerful for complex)
+    fast_model: str = field(default_factory=lambda: os.getenv("FAST_MODEL", "minimax/minimax-m2.1"))
+    powerful_model: str = field(default_factory=lambda: os.getenv("POWERFUL_MODEL", "anthropic/claude-3.5-sonnet"))
+
+    # Embedding model
+    embedding_model: str = field(default_factory=lambda: os.getenv("EMBEDDING_MODEL", "openai/text-embedding-3-small"))
+
     # Web Services
     firecrawl_api_key: str = field(default_factory=lambda: os.getenv("FIRECRAWL_API_KEY", "").strip())
     parallel_api_key: str = field(default_factory=lambda: os.getenv("PARALLEL_API_KEY", "").strip())
 
-    # LightRAG
-    lightrag_working_dir: str = field(default_factory=lambda: os.getenv("LIGHTRAG_WORKING_DIR", "./lightrag_data"))
-    lightrag_llm_model: str = field(default_factory=lambda: os.getenv("LIGHTRAG_LLM_MODEL", "minimax/minimax-m2.1"))
-    lightrag_embedding_model: str = field(default_factory=lambda: os.getenv("LIGHTRAG_EMBEDDING_MODEL", "openai/text-embedding-3-small"))
-    lightrag_default_mode: str = field(default_factory=lambda: os.getenv("LIGHTRAG_DEFAULT_MODE", "hybrid"))
-    lightrag_top_k: int = field(default_factory=lambda: int(os.getenv("LIGHTRAG_TOP_K", "5")))
-    lightrag_production: bool = field(default_factory=lambda: os.getenv("LIGHTRAG_PRODUCTION", "false").lower() == "true")
+    # Retrieval settings
+    retrieval_top_k: int = field(default_factory=lambda: int(os.getenv("RETRIEVAL_TOP_K", "5")))
+    bm25_weight: float = field(default_factory=lambda: float(os.getenv("BM25_WEIGHT", "0.4")))
+    vector_weight: float = field(default_factory=lambda: float(os.getenv("VECTOR_WEIGHT", "0.6")))
+
+    # Semantic cache settings
+    cache_similarity_threshold: float = field(default_factory=lambda: float(os.getenv("CACHE_SIMILARITY_THRESHOLD", "0.92")))
+    cache_max_entries: int = field(default_factory=lambda: int(os.getenv("CACHE_MAX_ENTRIES", "1000")))
+    cache_ttl_hours: int = field(default_factory=lambda: int(os.getenv("CACHE_TTL_HOURS", "24")))
 
     # Indexing Worker
     indexing_poll_interval: int = field(default_factory=lambda: int(os.getenv("INDEXING_POLL_INTERVAL", "10")))
@@ -82,14 +91,8 @@ class Config:
         """Get resolved database path."""
         return Path(self.db_path).resolve()
 
-    @property
-    def lightrag_working_dir_resolved(self) -> Path:
-        """Get resolved LightRAG working directory."""
-        return Path(self.lightrag_working_dir).resolve()
-
 
 # Global configuration instance (singleton)
-# Lazy initialization to allow tests to set env vars before config is created
 _config_instance: Optional[Config] = None
 
 
